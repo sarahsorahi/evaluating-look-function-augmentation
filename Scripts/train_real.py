@@ -2,169 +2,173 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score, f1_score
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     TrainingArguments,
-    Trainer
+    Trainer,
+    set_seed,
 )
 
-
-# ================================
-# 1. LOAD & CLEAN REAL DATA
-# ================================
-FILE = "/Users/aysasorahi/Documents/master/SLAM LAB/REZA/data/LOOK_three.ods"
+# ======================================
+# 1. LOAD & FILTER REAL DATA ONLY
+# ======================================
+FILE = "Data/LOOK_data.ods"   # <-- adjust if needed
 df = pd.read_excel(FILE, engine="odf")
 
-# Keep only REAL data (Label is NaN)
-df_real = df[df["Label"].isna()].copy()
+# REAL data = Label is NaN
+df = df[df["Label"].isna()].copy()
 
-# Normalize function names
-df_real["function"] = (
-    df_real["function"]
+# Normalize function labels
+df["function"] = (
+    df["function"]
     .astype(str)
-    .str.replace(r"\s+", "", regex=True)  # remove invisible spaces
+    .str.replace(r"\s+", "", regex=True)
     .str.strip()
     .str.upper()
 )
 
-# Only keep valid four classes
-valid = {"AS", "DIR", "DM", "INTJ"}
-df_real = df_real[df_real["function"].isin(valid)]
+VALID = {"AS", "DIR", "DM", "INTJ"}
+df = df[df["function"].isin(VALID)].reset_index(drop=True)
 
-print("\nCleaned REAL data counts:")
-print(df_real["function"].value_counts())
+print("\nREAL data distribution:")
+print(df["function"].value_counts())
 
+# Safety check
+counts = df["function"].value_counts()
+if (counts < 2).any():
+    raise ValueError("Each class must have at least 2 real samples.")
 
-# ================================
-# 2. VERIFY MINIMUM CLASS SIZE
-# ================================
-counts = df_real["function"].value_counts()
-too_small = counts[counts < 2]
-
-if len(too_small) > 0:
-    print("\n❌ ERROR: Some classes have fewer than 2 samples:")
-    print(too_small)
-    print("\nPlease fix your data first.")
-    exit()
-
-# ================================
-# 3. MAP LABELS
-# ================================
-labels = sorted(df_real["function"].unique())
+# ======================================
+# 2. LABEL MAPPING
+# ======================================
+labels = sorted(VALID)
 lab2id = {l: i for i, l in enumerate(labels)}
 id2lab = {i: l for l, i in lab2id.items()}
 
-df_real["label_id"] = df_real["function"].map(lab2id)
+df["label_id"] = df["function"].map(lab2id)
 
+X = df["sample"].astype(str).values
+y = df["label_id"].values
 
-# ================================
-# 4. TRAIN/TEST SPLIT (SAFE)
-# ================================
-train_df, test_df = train_test_split(
-    df_real,
-    test_size=0.20,
-    random_state=42,
-    stratify=df_real["label_id"],  # SAFE because all classes ≥ 2
-)
-
-print("\nTrain size:", len(train_df))
-print("Test size:", len(test_df))
-
-
-# ================================
-# Dataset class
-# ================================
+# ======================================
+# 3. DATASET
+# ======================================
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
 class LookDataset(Dataset):
     def __init__(self, texts, labels):
         enc = tokenizer(
-            texts.tolist(),
-            padding=True,
+            list(texts),
             truncation=True,
+            padding=True,
             max_length=128,
         )
-        self.enc = {k: torch.tensor(v) for k, v in enc.items()}
-        self.labels = torch.tensor(labels.tolist())
+        self.encodings = {k: torch.tensor(v) for k, v in enc.items()}
+        self.labels = torch.tensor(labels)
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        item = {k: v[idx] for k, v in self.enc.items()}
+        item = {k: v[idx] for k, v in self.encodings.items()}
         item["labels"] = self.labels[idx]
         return item
 
+# ======================================
+# 4. REPEATED 2-FOLD CV (50/50)
+# ======================================
+N_RUNS = 5
+N_SPLITS = 2
 
-train_ds = LookDataset(train_df["sample"], train_df["label_id"])
-test_ds  = LookDataset(test_df["sample"],  test_df["label_id"])
+acc_scores = []
+macro_f1_scores = []
 
+all_true = []
+all_pred = []
 
-# ================================
-# 5. MODEL
-# ================================
-model = AutoModelForSequenceClassification.from_pretrained(
-    "bert-base-uncased",
-    num_labels=len(labels),
-    id2label=id2lab,
-    label2id=lab2id,
+for run in range(N_RUNS):
+    seed = 42 + run
+    set_seed(seed)
+
+    print(f"\n========== RUN {run+1}/{N_RUNS} (seed={seed}) ==========")
+
+    skf = StratifiedKFold(
+        n_splits=N_SPLITS,
+        shuffle=True,
+        random_state=seed
+    )
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
+        print(f"\n--- Fold {fold}/{N_SPLITS} ---")
+
+        train_ds = LookDataset(X[train_idx], y[train_idx])
+        test_ds  = LookDataset(X[test_idx],  y[test_idx])
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            "bert-base-uncased",
+            num_labels=len(labels),
+            id2label=id2lab,
+            label2id=lab2id,
+        )
+
+        args = TrainingArguments(
+            output_dir=f"results/real_only/run{run+1}_fold{fold}",
+            num_train_epochs=3,
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=16,
+            save_strategy="no",
+            eval_strategy="no",
+            logging_steps=50,
+            seed=seed,
+            report_to="none",
+        )
+
+        trainer = Trainer(
+            model=model,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=test_ds,
+            tokenizer=tokenizer,
+        )
+
+        trainer.train()
+
+        preds = trainer.predict(test_ds)
+        y_true = preds.label_ids
+        y_hat = np.argmax(preds.predictions, axis=1)
+
+        acc = accuracy_score(y_true, y_hat)
+        macro_f1 = f1_score(y_true, y_hat, average="macro")
+
+        acc_scores.append(acc)
+        macro_f1_scores.append(macro_f1)
+
+        all_true.extend(y_true.tolist())
+        all_pred.extend(y_hat.tolist())
+
+        print(f"Fold Accuracy: {acc:.3f}")
+        print(f"Fold Macro F1: {macro_f1:.3f}")
+
+# ======================================
+# 5. FINAL SUMMARY
+# ======================================
+print("\n==============================")
+print("FINAL RESULTS (REAL-ONLY)")
+print(f"Evaluations: {N_RUNS * N_SPLITS}")
+print(f"Accuracy: {np.mean(acc_scores):.3f} ± {np.std(acc_scores):.3f}")
+print(f"Macro F1:  {np.mean(macro_f1_scores):.3f} ± {np.std(macro_f1_scores):.3f}")
+
+print("\nAggregated Classification Report:")
+print(
+    classification_report(
+        [id2lab[i] for i in all_true],
+        [id2lab[i] for i in all_pred],
+        digits=3,
+        zero_division=0,
+    )
 )
-
-
-# ================================
-# 6. TRAINING ARGUMENTS
-# ================================
-args = TrainingArguments(
-    output_dir="original_only_results",
-    num_train_epochs=3,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=16,
-    eval_strategy="epoch",     # Transformers v5
-    save_strategy="no",
-    logging_steps=50,
-    seed=42,
-)
-
-
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=train_ds,
-    eval_dataset=test_ds,
-    tokenizer=tokenizer,
-)
-
-
-# ================================
-# 7. TRAIN
-# ================================
-trainer.train()
-
-
-# ================================
-# 8. EVALUATE ON REAL-ONLY
-# ================================
-pred = trainer.predict(test_ds)
-y_true = pred.label_ids
-y_pred = np.argmax(pred.predictions, axis=1)
-
-acc = accuracy_score(y_true, y_pred)
-macro_f1 = f1_score(y_true, y_pred, average="macro")
-
-print("\n=== TEST RESULTS (REAL ONLY) ===")
-print("Accuracy:", round(acc, 3))
-print("Macro F1:", round(macro_f1, 3))
-print()
-
-rep = classification_report(
-    [id2lab[i] for i in y_true],
-    [id2lab[i] for i in y_pred],
-    digits=3,
-    zero_division=0,
-)
-print(rep)
-
