@@ -1,0 +1,236 @@
+import pandas as pd
+import numpy as np
+import torch
+
+from torch.utils.data import Dataset
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report
+from sklearn.utils.class_weight import compute_class_weight
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    set_seed
+)
+
+# ======================================================
+# 1. LOAD DATA
+# ======================================================
+FILE = "/Users/aysasorahi/Documents/master/SLAM LAB/REZA/data/LOOK_data.ods"
+df = pd.read_excel(FILE, engine="odf")
+
+df["function"] = (
+    df["function"]
+    .astype(str)
+    .str.replace(r"\s+", "", regex=True)
+    .str.strip()
+    .str.upper()
+)
+
+VALID = ["AS", "DIR", "DM", "INTJ"]
+df = df[df["function"].isin(VALID)].copy()
+
+# Split REAL / SYNTHETIC
+df_real  = df[df["Label"].isna()].copy()
+df_synth = df[df["Label"].notna()].copy()
+
+print("\nREAL distribution:")
+print(df_real["function"].value_counts())
+
+print("\nSYNTHETIC distribution:")
+print(df_synth["function"].value_counts())
+
+# ======================================================
+# 2. LABEL MAPPING
+# ======================================================
+labels = sorted(VALID)
+lab2id = {l: i for i, l in enumerate(labels)}
+id2lab = {i: l for l, i in lab2id.items()}
+
+df_real["label_id"]  = df_real["function"].map(lab2id)
+df_synth["label_id"] = df_synth["function"].map(lab2id)
+
+X_real = df_real["sample"].astype(str).values
+y_real = df_real["label_id"].values
+
+# ======================================================
+# 3. DATASET
+# ======================================================
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+class LookDataset(Dataset):
+    def __init__(self, texts, labels):
+        enc = tokenizer(
+            list(texts),
+            truncation=True,
+            padding=True,
+            max_length=128,
+        )
+        self.enc = {k: torch.tensor(v) for k, v in enc.items()}
+        self.labels = torch.tensor(labels)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        item = {k: v[idx] for k, v in self.enc.items()}
+        item["labels"] = self.labels[idx]
+        return item
+
+# ======================================================
+# 4. WEIGHTED TRAINER
+# ======================================================
+class WeightedTrainer(Trainer):
+    def __init__(self, class_weights, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels_ = inputs["labels"]
+        outputs = model(**inputs)
+        logits = outputs.logits
+        loss_fn = torch.nn.CrossEntropyLoss(
+            weight=self.class_weights.to(logits.device)
+        )
+        loss = loss_fn(logits, labels_)
+        return (loss, outputs) if return_outputs else loss
+
+# ======================================================
+# 5. EXPERIMENT LOOP (5 SEEDS × 2 FOLDS)
+# ======================================================
+SEEDS = [1, 2, 3, 4, 5]
+
+for seed in SEEDS:
+
+    print("\n" + "=" * 70)
+    print(f"SEED {seed}")
+    print("=" * 70)
+
+    set_seed(seed)
+
+    skf = StratifiedKFold(
+        n_splits=2,
+        shuffle=True,
+        random_state=seed
+    )
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X_real, y_real), 1):
+
+        print("\n" + "-" * 60)
+        print(f"FOLD {fold}")
+        print("-" * 60)
+
+        real_train = df_real.iloc[train_idx]
+        real_test  = df_real.iloc[test_idx]
+
+        # --------------------------------------------------
+        # REAL-ONLY CONDITION
+        # --------------------------------------------------
+        y_train_real = real_train["label_id"].values
+        class_weights_real = compute_class_weight(
+            class_weight="balanced",
+            classes=np.unique(y_train_real),
+            y=y_train_real
+        )
+        class_weights_real = torch.tensor(class_weights_real, dtype=torch.float)
+
+        train_ds_real = LookDataset(
+            real_train["sample"].astype(str),
+            y_train_real
+        )
+        test_ds = LookDataset(
+            real_test["sample"].astype(str),
+            real_test["label_id"].values
+        )
+
+        model_real = AutoModelForSequenceClassification.from_pretrained(
+            "bert-base-uncased",
+            num_labels=len(labels),
+            id2label=id2lab,
+            label2id=lab2id,
+        )
+
+        args = TrainingArguments(
+            output_dir=f"results/real/seed{seed}_fold{fold}",
+            num_train_epochs=3,
+            per_device_train_batch_size=16,
+            per_device_eval_batch_size=16,
+            eval_strategy="no",
+            save_strategy="no",
+            seed=seed,
+            report_to="none",
+        )
+
+        trainer_real = WeightedTrainer(
+            class_weights=class_weights_real,
+            model=model_real,
+            args=args,
+            train_dataset=train_ds_real,
+            tokenizer=tokenizer,
+        )
+
+        trainer_real.train()
+
+        preds = trainer_real.predict(test_ds)
+        print("\nREAL-ONLY RESULTS:")
+        print(
+            classification_report(
+                preds.label_ids,
+                np.argmax(preds.predictions, axis=1),
+                target_names=labels,
+                digits=3,
+                zero_division=0,
+            )
+        )
+
+        # --------------------------------------------------
+        # MIXED CONDITION (same real split + synthetic)
+        # --------------------------------------------------
+        mixed_train = pd.concat(
+            [real_train, df_synth],
+            ignore_index=True
+        )
+
+        y_train_mixed = mixed_train["label_id"].values
+        class_weights_mixed = compute_class_weight(
+            class_weight="balanced",
+            classes=np.unique(y_train_mixed),
+            y=y_train_mixed
+        )
+        class_weights_mixed = torch.tensor(class_weights_mixed, dtype=torch.float)
+
+        train_ds_mixed = LookDataset(
+            mixed_train["sample"].astype(str),
+            y_train_mixed
+        )
+
+        model_mixed = AutoModelForSequenceClassification.from_pretrained(
+            "bert-base-uncased",
+            num_labels=len(labels),
+            id2label=id2lab,
+            label2id=lab2id,
+        )
+
+        trainer_mixed = WeightedTrainer(
+            class_weights=class_weights_mixed,
+            model=model_mixed,
+            args=args,
+            train_dataset=train_ds_mixed,
+            tokenizer=tokenizer,
+        )
+
+        trainer_mixed.train()
+
+        preds = trainer_mixed.predict(test_ds)
+        print("\nMIXED (REAL + SYNTHETIC) RESULTS:")
+        print(
+            classification_report(
+                preds.label_ids,
+                np.argmax(preds.predictions, axis=1),
+                target_names=labels,
+                digits=3,
+                zero_division=0,
+            )
+        )
