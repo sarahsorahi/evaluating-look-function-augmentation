@@ -106,22 +106,6 @@ Performance is reported using:
 - Per-class Precision, Recall, and F1
 - Confusion matrices aggregated across runs
 
-This protocol ensures that improvements reflect genuine generalization to
-authentic language use.
 
----
 
-## Repository Structure
 
-```text
-.
-├── data/
-│   └── look_data.csv
-├── scripts/
-│   ├── train_real.py
-│   ├── train_real_synthetic.py
-│   └── train_synthetic.py
-├── results/
-│   ├── metrics/
-│   └── confusion_matrices/
-└── README.md
