@@ -81,27 +81,5 @@ Three training configurations are implemented and compared:
 Synthetic-only training is **not** used to support primary claims, but to aid
 interpretation and error analysis.
 
----
-
-## Evaluation Protocol
-
-All models are evaluated exclusively on **real, human-annotated samples**.
-Synthetic data is never used for evaluation.
-
-To ensure robustness and reduce variance due to data splits and random
-initialization, we use **repeated 2-fold cross-validation**:
-
-- The real dataset is split into **2 folds**
-- For each training configuration, training is repeated **5 times**
-- Each run uses a different random seed
-- Each experiment therefore consists of **10 evaluations** (2 folds × 5 runs)
-- Reported results are **averaged across all runs and folds**
-
-Performance is reported using:
-- Macro F1-score (primary metric)
-- Per-class Precision, Recall, and F1
-- Confusion matrices aggregated across runs
-
-
 
 
