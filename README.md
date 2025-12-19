@@ -4,10 +4,6 @@ This repository contains code and experiments for evaluating the impact of
 LLM-based data augmentation on the functional classification of the English
 verb *look*.
 
-The focus of this project is not on how synthetic data is generated, but on
-whether and how such data improves prediction performance on **real,
-human-annotated samples**.
-
 ---
 
 ## Task Description
